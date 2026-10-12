@@ -95,23 +95,53 @@ jobs:
           PY
           (cd output && sha256sum "$REGION_NAME.pmtiles" > "$REGION_NAME.pmtiles.sha256")
 
+      # Keep the verified result as a workflow artifact BEFORE publishing.
+      # A release failure can then be retried without rebuilding all map tiles.
+      - name: Save verified map for publishing retries
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-zenith-map
+          path: |
+            output/*.pmtiles
+            output/*.pmtiles.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish map to public Releases
+    needs: offline-basemap
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository for GitHub CLI
+        uses: actions/checkout@v4
+
+      - name: Restore verified map without rebuilding
+        uses: actions/download-artifact@v4
+        with:
+          name: verified-zenith-map
+          path: output
+
       - name: Publish raw PMTiles and checksum to GitHub Releases
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           REGION: ${{ inputs.region }}
           MAX_ZOOM: ${{ inputs.max_zoom }}
         run: |
           set -euo pipefail
+          REGION_NAME="$(basename "$REGION")"
           TAG="map-${REGION//\//-}-z$MAX_ZOOM"
           TITLE="Zenith offline map — $REGION (z$MAX_ZOOM)"
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "$TITLE" --latest=false \
+          test -s "output/$REGION_NAME.pmtiles"
+          test -s "output/$REGION_NAME.pmtiles.sha256"
+          if ! gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GH_REPO" --title "$TITLE" --latest=false \
               --notes "Offline OpenMapTiles vector basemap for Zenith. Source: Geofabrik OpenStreetMap data ($REGION). Max tile zoom $MAX_ZOOM. Map geometry only; offline routing requires a separate Valhalla pack. ODbL attribution: © OpenStreetMap contributors (https://www.openstreetmap.org/copyright)."
           fi
-          # GitHub Actions artifact ZIPs aren't used for app downloads:
-          # the public Release asset is a directly downloadable .pmtiles file.
-          gh release upload "$TAG" \
+          # Release assets are raw PMTiles files, not zipped workflow artifacts.
+          gh release upload "$TAG" --repo "$GH_REPO" \
             "output/$REGION_NAME.pmtiles" \
             "output/$REGION_NAME.pmtiles.sha256" --clobber
-          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          echo "Published https://github.com/$GH_REPO/releases/tag/$TAG"
