@@ -1,0 +1,117 @@
+name: Build and publish Zenith offline map
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "Geofabrik region like europe/monaco or north-america/us/arizona"
+        required: true
+        type: string
+        default: "europe/monaco"
+      max_zoom:
+        description: "Maximum tile zoom (11-14). Lower saves storage; 14 is more detailed."
+        required: true
+        type: choice
+        options: ["11", "12", "13", "14"]
+        default: "13"
+
+permissions:
+  contents: write
+
+# Don't allow two builds to overwrite the same region release simultaneously.
+concurrency:
+  group: offline-map-${{ inputs.region }}-z${{ inputs.max_zoom }}
+  cancel-in-progress: false
+
+jobs:
+  offline-basemap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Validate selected region
+        shell: bash
+        env:
+          REGION: ${{ inputs.region }}
+        run: |
+          set -euo pipefail
+          [[ "$REGION" =~ ^[a-z0-9]+([/-][a-z0-9]+)*$ ]] || exit 1
+          echo "REGION_NAME=$(basename "$REGION")" >> "$GITHUB_ENV"
+          echo "PBF_URL=https://download.geofabrik.de/$REGION-latest.osm.pbf" >> "$GITHUB_ENV"
+
+      - name: Download source OSM extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --connect-timeout 40 \
+            --max-time 2100 --max-filesize 1600000000 "$PBF_URL" -o region.osm.pbf
+          test -s region.osm.pbf
+
+      - name: Generate OpenMapTiles-schema PMTiles
+        shell: bash
+        env:
+          MAX_ZOOM: ${{ inputs.max_zoom }}
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          # OSM schema MUST match the existing OpenFreeMap Liberty style.
+          # Protomaps / Shortbread .pmtiles are incompatible with it.
+          docker run --rm -v "$PWD:/work" -w /work \
+            --memory=7g \
+            openmaptiles/planetiler-openmaptiles:latest \
+            --force --download --osm_path=/work/region.osm.pbf \
+            --output=/work/output/map.pmtiles --maxzoom="$MAX_ZOOM"
+          test -s output/map.pmtiles
+          cp output/map.pmtiles "output/$REGION_NAME.pmtiles"
+
+      - name: Verify PMTiles and prepare checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="output/$REGION_NAME.pmtiles"
+          python3 - "$FILE" <<'PY'
+          import gzip, json, pathlib, struct, sys
+          p = pathlib.Path(sys.argv[1])
+          with p.open("rb") as f:
+              h = f.read(127)
+              if len(h) != 127 or h[:7] != b"PMTiles" or h[7] != 3 or h[99] != 1:
+                  raise SystemExit("Not a PMTiles v3 vector basemap")
+              offset, length = struct.unpack_from("<QQ", h, 24)
+              if offset < 127 or length > 2_000_000 or offset + length > p.stat().st_size:
+                  raise SystemExit("Invalid PMTiles metadata bounds")
+              f.seek(offset)
+              raw = f.read(length)
+              if h[97] == 2:
+                  raw = gzip.decompress(raw)
+              elif h[97] != 1:
+                  raise SystemExit("Unsupported metadata compression")
+              layers = {x.get("id") for x in json.loads(raw).get("vector_layers", [])}
+              missing = {"transportation", "building", "water", "place"} - layers
+              if missing:
+                  raise SystemExit(f"Not OpenMapTiles compatible; missing layers: {sorted(missing)}")
+          # A release asset must be smaller than GitHub's 2 GiB asset limit.
+          if p.stat().st_size >= 2 * 1024**3:
+              raise SystemExit("Map exceeds GitHub Releases 2 GiB single-asset limit")
+          print(f"Verified: {p.name} ({p.stat().st_size} bytes)")
+          PY
+          (cd output && sha256sum "$REGION_NAME.pmtiles" > "$REGION_NAME.pmtiles.sha256")
+
+      - name: Publish raw PMTiles and checksum to GitHub Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGION: ${{ inputs.region }}
+          MAX_ZOOM: ${{ inputs.max_zoom }}
+        run: |
+          set -euo pipefail
+          TAG="map-${REGION//\//-}-z$MAX_ZOOM"
+          TITLE="Zenith offline map — $REGION (z$MAX_ZOOM)"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TITLE" --latest=false \
+              --notes "Offline OpenMapTiles vector basemap for Zenith. Source: Geofabrik OpenStreetMap data ($REGION). Max tile zoom $MAX_ZOOM. Map geometry only; offline routing requires a separate Valhalla pack. ODbL attribution: © OpenStreetMap contributors (https://www.openstreetmap.org/copyright)."
+          fi
+          # GitHub Actions artifact ZIPs aren't used for app downloads:
+          # the public Release asset is a directly downloadable .pmtiles file.
+          gh release upload "$TAG" \
+            "output/$REGION_NAME.pmtiles" \
+            "output/$REGION_NAME.pmtiles.sha256" --clobber
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
