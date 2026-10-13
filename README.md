@@ -44,7 +44,7 @@ The bulk workflow runs **only when manually dispatched**; adding it does not sta
 
 Open [Build Remaining North America](https://github.com/ItzCrim/Zenith-Repo/actions/workflows/build-north-america.yml) → **Run workflow**.
 - `test_belize` (default): one-region test.
-- `all_north_america`: **31 targets**: twelve Canadian provinces/territories (excluding BC); two geographic BC parts; Mexico and Greenland; eleven individually named Central America/Caribbean regions; Puerto Rico, US Virgin Islands, and Washington DC; and one optional combined Central America map for otherwise omitted island coverage. The last combined extract overlaps the individual countries.
+- `all_north_america`: **33 targets**: eleven Canadian provinces/territories (excluding BC and Nunavut); two geographic BC parts; three official Nunavut subregions (Kitikmeot, Kivalliq and Qikiqtaaluk); Mexico and Greenland; eleven individually named Central America/Caribbean regions; Puerto Rico, US Virgin Islands, and Washington DC; and one optional combined Central America map for otherwise omitted island coverage. The last combined extract overlaps the individual countries.
 - Map builds are **max zoom 14 only** (including the single-region and US bulk workflows). Two jobs execute concurrently; already-published releases with both raw PMTiles and SHA-256 files are skipped.
 - Failures do not cancel unrelated builds. Output size is checked before publishing; an archive exceeding the **2 GiB** individual GitHub Release asset limit fails clearly.
 
@@ -60,3 +60,5 @@ The two geographic packages cover BC's six official Geofabrik subregions. They a
 **Zenith Android 0.3.0 limitation:** Multiple maps may be downloaded and stored, but only **one map is displayed at once**. Full seamless viewing of North + South together needs an additional multi-source renderer update; publishing these two packages does *not* automatically enable it.
 
 Source directories: [North America](https://download.geofabrik.de/north-america.html), [Canada](https://download.geofabrik.de/north-america/canada.html), [British Columbia](https://download.geofabrik.de/north-america/canada/british-columbia.html), [Central America](https://download.geofabrik.de/central-america.html).
+
+Nunavut's full PBF approaches the workflow's input size limit; the North America matrix builds its three [official Geofabrik subregions](https://download.geofabrik.de/north-america/canada/nunavut.html) instead of the combined province to reduce package sizes.
