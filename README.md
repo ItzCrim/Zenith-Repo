@@ -62,3 +62,11 @@ The two geographic packages cover BC's six official Geofabrik subregions. They a
 Source directories: [North America](https://download.geofabrik.de/north-america.html), [Canada](https://download.geofabrik.de/north-america/canada.html), [British Columbia](https://download.geofabrik.de/north-america/canada/british-columbia.html), [Central America](https://download.geofabrik.de/central-america.html).
 
 Nunavut's full PBF approaches the workflow's input size limit; the North America matrix builds its three [official Geofabrik subregions](https://download.geofabrik.de/north-america/canada/nunavut.html) instead of the combined province to reduce package sizes.
+
+## Connected Valhalla routing, not independent state extracts
+
+[Build Connected Valhalla Routes](https://github.com/ItzCrim/Zenith-Repo/actions/workflows/build-connected-routes.yml) builds a **single coherent Valhalla graph** from two or more adjacent Geofabrik PBFs, then publishes it in complementary `.crimroute` ZIP pieces. The default test includes Arizona and Nevada and produces two parts. Both parts are required to activate that graph in Zenith 0.3.3.
+
+This is different from the old `.crimroute` v1 workflow, which compiles each state separately and cannot reliably route across state borders. The new `crims-valhalla-tiles-v2` format includes a `graph_set` identity and required part count; the app stores route ZIPs independently and expands compatible shards into one native Valhalla tile directory. It only activates a set when **all parts** have arrived.
+
+Up to three routing archives are **downloaded simultaneously**, with no arbitrary three-pack storage limit. Building a full-US graph may require a much larger runner than GitHub's standard hosted runners. Do not combine independently built graph shards merely because their paths look compatible.
