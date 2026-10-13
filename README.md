@@ -22,3 +22,19 @@ The same region + zoom updates its matching release assets if you rebuild it. No
 - Source data is OpenStreetMap via [Geofabrik](https://download.geofabrik.de/). OpenStreetMap data is made available under ODbL; copyright © OpenStreetMap contributors. Follow source licensing requirements for reuse and attribution.
 - To avoid provider abuse, packages are generated from regional source extracts, **not scraped from OpenFreeMap's public tile servers**.
 - The workflow must be manually started by an authorized repository collaborator. Publishing uses this repository's own `GITHUB_TOKEN` with `contents: write` permissions; no private-repository credentials are required.
+
+
+## Automate all 50 U.S. states
+
+You do **not** need to launch each state manually. Use [Actions → Build All US State Offline Maps](https://github.com/ItzCrim/Zenith-Repo/actions/workflows/build-all-states.yml) and choose **Run workflow**.
+
+- **Test mode (default):** `test_delaware` runs just Delaware, to confirm the bulk pipeline is healthy.
+- **All 50 states:** `all_50_states` queues every state using validated Geofabrik region paths, including all 50 states and excluding DC/territories.
+- **Zoom:** Defaults to 14, matching previously published Arizona/Nevada/Washington packages; lower zoom uses less storage, but generates a separate release.
+- **Concurrency:** Two regions build at a time. Other regions wait for a runner. Each region checks for an already-published `.pmtiles` and checksum before doing expensive work, and skips those if both are present.
+- **Fault isolation:** One state failing does **not** cancel the remaining state builds. You can use **Re-run failed jobs** from the batch workflow or run a specific region manually afterward.
+- **Build-minute and size caution:** Building all 50 can consume substantial Actions time, storage, and network bandwidth. A few high-volume states may exceed available runner disk/memory, timeouts, or the 2 GiB per Release asset limit. Failures are reported rather than silently treated as published maps.
+- **Do not start two full batches concurrently.** Let outstanding manually started states finish first to minimize repeated build minutes.
+- **Publication:** Successful regions publish raw `.pmtiles` Release assets and checksums, and automatically appear in Zenith 0.2.1's public map catalog.
+
+The bulk workflow runs **only when manually dispatched**; adding it does not start 50 map builds or change the Android application.

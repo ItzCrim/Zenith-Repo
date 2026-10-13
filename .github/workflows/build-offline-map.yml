@@ -15,6 +15,22 @@ on:
         options: ["11", "12", "13", "14"]
         default: "13"
 
+  workflow_call:
+    inputs:
+      region:
+        description: "Geofabrik region such as north-america/us/arizona"
+        required: true
+        type: string
+      max_zoom:
+        description: "Maximum tile zoom, from 11 to 14"
+        required: true
+        type: string
+      skip_existing:
+        description: "Skip when an existing Release already has PMTiles and checksum"
+        type: boolean
+        required: false
+        default: false
+
 permissions:
   contents: write
 
@@ -24,7 +40,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check-release:
+    name: Check existing published package
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.inspect.outputs.build }}
+      artifact: ${{ steps.inspect.outputs.artifact }}
+    steps:
+      - name: Check region and Release assets
+        id: inspect
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REGION: ${{ inputs.region }}
+          MAX_ZOOM: ${{ inputs.max_zoom }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
+        run: |
+          set -euo pipefail
+          [[ "$REGION" =~ ^[a-z0-9]+([/-][a-z0-9]+)*$ ]] || {
+            echo "::error::Invalid Geofabrik region"; exit 1;
+          }
+          [[ "$MAX_ZOOM" =~ ^(11|12|13|14)$ ]] || {
+            echo "::error::Zoom must be between 11 and 14"; exit 1;
+          }
+          REGION_NAME="$(basename "$REGION")"
+          TAG="map-${REGION//\//-}-z$MAX_ZOOM"
+          echo "artifact=verified-zenith-$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$SKIP_EXISTING" == "true" ]]; then
+            ASSETS="$(mktemp)"
+            if gh release view "$TAG" --repo "$GH_REPO" \
+              --json assets --jq '.assets[].name' > "$ASSETS" 2>/dev/null; then
+              if grep -Fxq "$REGION_NAME.pmtiles" "$ASSETS" && \
+                 grep -Fxq "$REGION_NAME.pmtiles.sha256" "$ASSETS"; then
+                echo "build=false" >> "$GITHUB_OUTPUT"
+                echo "::notice::Skipping existing $TAG (raw map and checksum published)"
+                exit 0
+              fi
+            fi
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          echo "Building $TAG"
+
   offline-basemap:
+    needs: check-release
+    if: needs.check-release.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
@@ -100,7 +161,7 @@ jobs:
       - name: Save verified map for publishing retries
         uses: actions/upload-artifact@v4
         with:
-          name: verified-zenith-map
+          name: ${{ needs.check-release.outputs.artifact }}
           path: |
             output/*.pmtiles
             output/*.pmtiles.sha256
@@ -109,7 +170,8 @@ jobs:
 
   publish-release:
     name: Publish map to public Releases
-    needs: offline-basemap
+    needs: [check-release, offline-basemap]
+    if: needs.check-release.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -119,7 +181,7 @@ jobs:
       - name: Restore verified map without rebuilding
         uses: actions/download-artifact@v4
         with:
-          name: verified-zenith-map
+          name: ${{ needs.check-release.outputs.artifact }}
           path: output
 
       - name: Publish raw PMTiles and checksum to GitHub Releases
