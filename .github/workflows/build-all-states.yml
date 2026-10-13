@@ -11,12 +11,6 @@ on:
           - all_50_states
         default: test_delaware
         required: true
-      max_zoom:
-        description: "Map detail: zoom 14 matches the existing Arizona/Nevada/Washington packs"
-        type: choice
-        options: ["14", "13", "12", "11"]
-        default: "14"
-        required: true
 
 # The called workflow publishes releases using this repository's GITHUB_TOKEN.
 permissions:
@@ -56,5 +50,5 @@ jobs:
     uses: ./.github/workflows/build-offline-map.yml
     with:
       region: ${{ matrix.region }}
-      max_zoom: ${{ inputs.max_zoom }}
+      max_zoom: "14"
       skip_existing: true

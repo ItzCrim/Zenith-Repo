@@ -38,3 +38,25 @@ You do **not** need to launch each state manually. Use [Actions → Build All US
 - **Publication:** Successful regions publish raw `.pmtiles` Release assets and checksums, and automatically appear in Zenith 0.2.1's public map catalog.
 
 The bulk workflow runs **only when manually dispatched**; adding it does not start 50 map builds or change the Android application.
+
+
+## Build the rest of North America (fixed zoom 14)
+
+Open [Build Remaining North America](https://github.com/ItzCrim/Zenith-Repo/actions/workflows/build-north-america.yml) → **Run workflow**.
+- `test_belize` (default): one-region test.
+- `all_north_america`: **31 targets**: twelve Canadian provinces/territories (excluding BC); two geographic BC parts; Mexico and Greenland; eleven individually named Central America/Caribbean regions; Puerto Rico, US Virgin Islands, and Washington DC; and one optional combined Central America map for otherwise omitted island coverage. The last combined extract overlaps the individual countries.
+- Map builds are **max zoom 14 only** (including the single-region and US bulk workflows). Two jobs execute concurrently; already-published releases with both raw PMTiles and SHA-256 files are skipped.
+- Failures do not cancel unrelated builds. Output size is checked before publishing; an archive exceeding the **2 GiB** individual GitHub Release asset limit fails clearly.
+
+### British Columbia: North + South
+
+`north-america/canada/british-columbia/north` and `north-america/canada/british-columbia/south` are **virtual Zenith workflow inputs**, not Geofabrik download paths.
+
+- **North** is built from Geofabrik's real `north-admreg-latest.osm.pbf`. Published asset: `british-columbia-north.pmtiles`.
+- **South** merges `interior-admreg`, `island-admreg`, `kootenay-admreg`, `okanagan-admreg`, and `southcoast-admreg` using `osmium merge`. Published asset: `british-columbia-south.pmtiles`.
+
+The two geographic packages cover BC's six official Geofabrik subregions. They are not arbitrary byte-splits, and each is a standalone map with its own Release and checksum. They must both be downloaded for full BC coverage. These parts save distribution size per asset, but do not guarantee final output sizes until they have actually been built.
+
+**Zenith Android 0.3.0 limitation:** Multiple maps may be downloaded and stored, but only **one map is displayed at once**. Full seamless viewing of North + South together needs an additional multi-source renderer update; publishing these two packages does *not* automatically enable it.
+
+Source directories: [North America](https://download.geofabrik.de/north-america.html), [Canada](https://download.geofabrik.de/north-america/canada.html), [British Columbia](https://download.geofabrik.de/north-america/canada/british-columbia.html), [Central America](https://download.geofabrik.de/central-america.html).

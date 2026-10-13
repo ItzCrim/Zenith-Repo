@@ -9,11 +9,11 @@ on:
         type: string
         default: "europe/monaco"
       max_zoom:
-        description: "Maximum tile zoom (11-14). Lower saves storage; 14 is more detailed."
+        description: "Fixed max zoom 14 for all published Zenith maps"
         required: true
         type: choice
-        options: ["11", "12", "13", "14"]
-        default: "13"
+        options: ["14"]
+        default: "14"
 
   workflow_call:
     inputs:
@@ -22,7 +22,7 @@ on:
         required: true
         type: string
       max_zoom:
-        description: "Maximum tile zoom, from 11 to 14"
+        description: "Fixed maximum zoom 14"
         required: true
         type: string
       skip_existing:
@@ -62,10 +62,14 @@ jobs:
           [[ "$REGION" =~ ^[a-z0-9]+([/-][a-z0-9]+)*$ ]] || {
             echo "::error::Invalid Geofabrik region"; exit 1;
           }
-          [[ "$MAX_ZOOM" =~ ^(11|12|13|14)$ ]] || {
-            echo "::error::Zoom must be between 11 and 14"; exit 1;
+          [[ "$MAX_ZOOM" == "14" ]] || {
+            echo "::error::Zenith publishes max zoom 14 only"; exit 1;
           }
           REGION_NAME="$(basename "$REGION")"
+          if [[ "$REGION" == "north-america/canada/british-columbia/north" ||
+                "$REGION" == "north-america/canada/british-columbia/south" ]]; then
+            REGION_NAME="british-columbia-${REGION##*/}"
+          fi
           TAG="map-${REGION//\//-}-z$MAX_ZOOM"
           echo "artifact=verified-zenith-$TAG" >> "$GITHUB_OUTPUT"
           if [[ "$SKIP_EXISTING" == "true" ]]; then
@@ -96,16 +100,49 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$REGION" =~ ^[a-z0-9]+([/-][a-z0-9]+)*$ ]] || exit 1
-          echo "REGION_NAME=$(basename "$REGION")" >> "$GITHUB_ENV"
+          if [[ "$REGION" == "north-america/canada/british-columbia/north" ||
+                "$REGION" == "north-america/canada/british-columbia/south" ]]; then
+            echo "REGION_NAME=british-columbia-${REGION##*/}" >> "$GITHUB_ENV"
+          else
+            echo "REGION_NAME=$(basename "$REGION")" >> "$GITHUB_ENV"
+          fi
           echo "PBF_URL=https://download.geofabrik.de/$REGION-latest.osm.pbf" >> "$GITHUB_ENV"
 
-      - name: Download source OSM extract
+      - name: Download or assemble geographic OSM extract
         shell: bash
+        env:
+          REGION: ${{ inputs.region }}
         run: |
           set -euo pipefail
-          curl --fail --location --retry 2 --connect-timeout 40 \
-            --max-time 2100 --max-filesize 1600000000 "$PBF_URL" -o region.osm.pbf
+          # Virtual BC North / South requests use the six official Geofabrik
+          # administrative subregions rather than byte-splitting PMTiles.
+          BC="https://download.geofabrik.de/north-america/canada/british-columbia"
+          if [[ "$REGION" == "north-america/canada/british-columbia/north" ]]; then
+            curl --fail --location --retry 3 --connect-timeout 40 \
+              --max-time 2100 --max-filesize 1600000000 \
+              "$BC/north-admreg-latest.osm.pbf" -o region.osm.pbf
+          elif [[ "$REGION" == "north-america/canada/british-columbia/south" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq osmium-tool
+            mkdir -p south-pbfs
+            for part in interior-admreg island-admreg kootenay-admreg \
+                        okanagan-admreg southcoast-admreg; do
+              echo "Downloading BC South: $part"
+              curl --fail --location --retry 3 --connect-timeout 40 \
+                --max-time 2100 --max-filesize 1600000000 \
+                "$BC/$part-latest.osm.pbf" -o "south-pbfs/$part.osm.pbf"
+              test -s "south-pbfs/$part.osm.pbf"
+            done
+            # Osmium merges sorted extracts and de-duplicates shared objects.
+            osmium merge south-pbfs/*.osm.pbf -o region.osm.pbf
+            osmium fileinfo -e region.osm.pbf
+            rm -rf south-pbfs
+          else
+            curl --fail --location --retry 3 --connect-timeout 40 \
+              --max-time 2100 --max-filesize 1600000000 "$PBF_URL" -o region.osm.pbf
+          fi
           test -s region.osm.pbf
+          echo "Source extract ready: $(du -h region.osm.pbf | cut -f1)"
 
       - name: Generate OpenMapTiles-schema PMTiles
         shell: bash
@@ -194,13 +231,23 @@ jobs:
         run: |
           set -euo pipefail
           REGION_NAME="$(basename "$REGION")"
+          if [[ "$REGION" == "north-america/canada/british-columbia/north" ||
+                "$REGION" == "north-america/canada/british-columbia/south" ]]; then
+            REGION_NAME="british-columbia-${REGION##*/}"
+          fi
           TAG="map-${REGION//\//-}-z$MAX_ZOOM"
           TITLE="Zenith offline map — $REGION (z$MAX_ZOOM)"
           test -s "output/$REGION_NAME.pmtiles"
           test -s "output/$REGION_NAME.pmtiles.sha256"
+          NOTES="Offline OpenMapTiles vector basemap for Zenith. Source: Geofabrik OpenStreetMap data ($REGION). Max tile zoom $MAX_ZOOM. Map geometry only; offline routing requires a separate Valhalla pack. ODbL attribution: © OpenStreetMap contributors (https://www.openstreetmap.org/copyright)."
+          if [[ "$REGION" == "north-america/canada/british-columbia/north" ]]; then
+            NOTES+=" BC North uses the official Geofabrik north-admreg extract. BC South is a separate download for full provincial coverage."
+          elif [[ "$REGION" == "north-america/canada/british-columbia/south" ]]; then
+            NOTES+=" BC South combines the official Geofabrik interior, island, kootenay, okanagan and southcoast administrative extracts. BC North is a separate download for full coverage."
+          fi
           if ! gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GH_REPO" --title "$TITLE" --latest=false \
-              --notes "Offline OpenMapTiles vector basemap for Zenith. Source: Geofabrik OpenStreetMap data ($REGION). Max tile zoom $MAX_ZOOM. Map geometry only; offline routing requires a separate Valhalla pack. ODbL attribution: © OpenStreetMap contributors (https://www.openstreetmap.org/copyright)."
+              --notes "$NOTES"
           fi
           # Release assets are raw PMTiles files, not zipped workflow artifacts.
           gh release upload "$TAG" --repo "$GH_REPO" \

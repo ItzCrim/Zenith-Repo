@@ -1,0 +1,53 @@
+name: Build Remaining North America (Zoom 14)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Test one small map or process all remaining North American maps"
+        type: choice
+        options:
+          - test_belize
+          - all_north_america
+        default: test_belize
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  choose-regions:
+    name: Prepare zoom-14 map queue
+    runs-on: ubuntu-latest
+    outputs:
+      regions: ${{ steps.choose.outputs.regions }}
+    steps:
+      - name: Choose test or full coverage
+        id: choose
+        shell: bash
+        env:
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          if [[ "$SCOPE" == "test_belize" ]]; then
+            echo 'regions=["central-america/belize"]' >> "$GITHUB_OUTPUT"
+          elif [[ "$SCOPE" == "all_north_america" ]]; then
+            echo 'regions=["north-america/canada/alberta","north-america/canada/manitoba","north-america/canada/new-brunswick","north-america/canada/newfoundland-and-labrador","north-america/canada/northwest-territories","north-america/canada/nova-scotia","north-america/canada/nunavut","north-america/canada/ontario","north-america/canada/prince-edward-island","north-america/canada/quebec","north-america/canada/saskatchewan","north-america/canada/yukon","north-america/canada/british-columbia/north","north-america/canada/british-columbia/south","north-america/mexico","north-america/greenland","central-america/bahamas","central-america/belize","central-america/costa-rica","central-america/cuba","central-america/el-salvador","central-america/guatemala","central-america/haiti-and-domrep","central-america/honduras","central-america/jamaica","central-america/nicaragua","central-america/panama","north-america/us/puerto-rico","north-america/us/us-virgin-islands","north-america/us/district-of-columbia","central-america"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Unknown scope: $SCOPE"
+            exit 1
+          fi
+
+  build-regions:
+    name: ${{ matrix.region }} (z14)
+    needs: choose-regions
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        region: ${{ fromJSON(needs.choose-regions.outputs.regions) }}
+    uses: ./.github/workflows/build-offline-map.yml
+    with:
+      region: ${{ matrix.region }}
+      max_zoom: "14"
+      skip_existing: true
