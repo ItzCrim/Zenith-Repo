@@ -1,0 +1,123 @@
+name: Build Connected Valhalla Routes
+
+on:
+  workflow_dispatch:
+    inputs:
+      graph_name:
+        description: "Label for one connected routing graph"
+        type: string
+        default: southwest-az-nv
+        required: true
+      catalog_region:
+        description: "Zenith catalog region path"
+        type: string
+        default: north-america/us/southwest
+        required: true
+      geofabrik_regions:
+        description: "Comma-separated source PBF regions all built TOGETHER"
+        type: string
+        default: north-america/us/arizona,north-america/us/nevada
+        required: true
+      parts:
+        description: "Complementary output ZIP count"
+        type: choice
+        options: ["2","4","8","16"]
+        default: "2"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: connected-valhalla-${{ inputs.graph_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-connected-routes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download all source regions for one connected graph
+        shell: bash
+        env:
+          INPUT_REGIONS: ${{ inputs.geofabrik_regions }}
+          INPUT_NAME: ${{ inputs.graph_name }}
+          INPUT_CATALOG: ${{ inputs.catalog_region }}
+        run: |
+          set -euo pipefail
+          [[ "$INPUT_NAME" =~ ^[a-z0-9_-]{3,80}$ ]] || exit 1
+          [[ "$INPUT_CATALOG" =~ ^[a-z0-9-]+(/[a-z0-9-]+)+$ ]] || exit 1
+          IFS=',' read -ra REGIONS <<< "$INPUT_REGIONS"
+          (( ${#REGIONS[@]} >= 2 && ${#REGIONS[@]} <= 16 )) || {
+            echo "::error::Select 2 to 16 adjacent Geofabrik regions";exit 1;
+          }
+          mkdir -p pbfs
+          n=0
+          for region in "${REGIONS[@]}"; do
+            [[ "$region" =~ ^[a-z0-9-]+(/[a-z0-9-]+)+$ ]] || exit 1
+            n=$((n+1))
+            number="$(printf '%02d' "$n")"
+            curl --fail --location --retry 3 --connect-timeout 40 \
+              --max-time 2100 --max-filesize 1500000000 \
+              "https://download.geofabrik.de/${region}-latest.osm.pbf" \
+              -o "pbfs/${number}.osm.pbf"
+            test -s "pbfs/${number}.osm.pbf"
+          done
+          sha256sum pbfs/*.osm.pbf > pbfs/source-checksums.txt
+          graph_hash="$(sha256sum pbfs/source-checksums.txt | cut -c1-20)"
+          echo "GRAPH_SET=route-$graph_hash" >> "$GITHUB_ENV"
+          echo "GRAPH_NAME=$INPUT_NAME" >> "$GITHUB_ENV"
+          echo "CATALOG=$INPUT_CATALOG" >> "$GITHUB_ENV"
+      - name: Build all state boundaries in one connected Valhalla graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tiles
+          docker run --rm --entrypoint /bin/bash \
+            -v "$PWD:/work" -w /work \
+            ghcr.io/valhalla/valhalla:3.9.0 -lc '
+              set -euo pipefail
+              valhalla_build_config \
+                --mjolnir-tile-dir /work/tiles \
+                --mjolnir-tile-extract /work/tiles.tar \
+                --mjolnir-timezone /work/tiles/timezones.sqlite \
+                --mjolnir-admin /work/tiles/admins.sqlite > /work/valhalla.json
+              valhalla_build_timezones > /work/tiles/timezones.sqlite
+              valhalla_build_admins -c /work/valhalla.json /work/pbfs/*.osm.pbf
+              valhalla_build_tiles -c /work/valhalla.json /work/pbfs/*.osm.pbf
+              find /work/tiles -name "*.gph" -print -quit | grep -q "\.gph"
+            '
+      - name: Package complementary graph parts under 2 GiB each
+        shell: bash
+        env:
+          PART_COUNT: ${{ inputs.parts }}
+        run: |
+          set -euo pipefail
+          python tools/package_connected_valhalla.py \
+            --tiles tiles --output output \
+            --name "$GRAPH_NAME" --region "$CATALOG" \
+            --parts "$PART_COUNT" --graph-set "$GRAPH_SET"
+      - name: Publish each graph part as a raw Release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PART_COUNT: ${{ inputs.parts }}
+        run: |
+          set -euo pipefail
+          for part in $(seq 1 "$PART_COUNT"); do
+            filename="$GRAPH_NAME-part-$part.crimroute"
+            tag="route-$GRAPH_NAME-v2-$GRAPH_SET-part-$part"
+            test -s "output/$filename"
+            test -s "output/$filename.sha256"
+            note="Connected Valhalla routing built TOGETHER from OSM source regions. Source: Geofabrik OpenStreetMap data ($CATALOG). All $PART_COUNT packages from graph_set=$GRAPH_SET must be downloaded for cross-border routing. They are complementary pieces of one graph, not independently compiled state graphs. © OpenStreetMap contributors (ODbL)."
+            if ! gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+              gh release create "$tag" --repo "$GH_REPO" --title "Zenith connected routes — $GRAPH_NAME ($part/$PART_COUNT)" --latest=false --notes "$note"
+            fi
+            gh release upload "$tag" --repo "$GH_REPO" \
+              "output/$filename" "output/$filename.sha256" --clobber
+          done
