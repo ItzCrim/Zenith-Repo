@@ -39,7 +39,9 @@ jobs:
     # require an eligible paid Team/Enterprise organization and provisioning.
     # Never silently fall back to an insufficient standard ubuntu-latest.
     runs-on: ${{ fromJSON(inputs.runner_mode == 'self-hosted' && '["self-hosted","linux","x64","zenith-us-routing"]' || '"ubuntu-24.04-32core"') }}
-    timeout-minutes: 360
+    # Self-hosted builds may take most of a day; GitHub's hosted limits
+    # may still impose a shorter job duration on hosted larger runners.
+    timeout-minutes: 1440
     env:
       GRAPH_NAME: usa-connected
       CATALOG: north-america/us
