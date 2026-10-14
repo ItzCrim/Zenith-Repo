@@ -77,6 +77,38 @@ We have NOT proven a minimal JNI library can exclude all renderer code.
 
 Logs: https://github.com/ItzCrim/Zenith-Repo/actions/runs/38546793403
 
+## Verified probe 2: Phoenix offline driving (GitHub Actions 38547988899)
+
+**Passed all required steps.** With generated `types.txt` and
+`classificator.txt`, targeted `CrossBorderGraph_SerDes` and
+`RestrictionTest_CrossGraph_NoUTurn` native tests passed.
+
+The CLI fetched and SHA-1-verified the **US_Arizona_Phoenix.mwm**
+(209,060,569 bytes) under catalog version 261004. It calculated the
+following **completely offline** car route using ONE native worker:
+
+- From **Phoenix downtown (33.4484, -112.0740)** to
+  **Tempe (33.4255, -111.9400)**.
+- RouterResultCode=0 (NoError), route **16,347.48 metres**,
+  estimated travel **1,195.81 seconds**, and **439 geometry points**.
+- Route calculation **2.6773 s** (total CLI wall time **2.81 s**).
+- CLI **peak RSS 137,680 KiB (~134.45 MiB)**, no swap.
+- This test did not load `World.mwm` or `WorldCoasts.mwm`; the
+  CLI logged that they were absent but still returned NoError.
+
+This verifies **real local offline navigation**, not JNI embedding,
+live phone navigation, spoken directions, or interstate routes. The
+upstream CLI dumps route geometry/distance/time; Zenith would need a
+thin custom JNI adapter to access turn/lane data available from
+`routing::Route`.
+
+Successful run:
+https://github.com/ItzCrim/Zenith-Repo/actions/runs/38547988899
+
+A separate run attempts **Phoenix → Tucson across two MWMs** to
+evaluate actual inter-region continuity; this will need a different
+dataset and should not be conflated with the passing single-region route.
+
 ## Trial sequence and no-go criteria
 
 1. **Independent native compile:** clone a pinned CoMaps source revision and
