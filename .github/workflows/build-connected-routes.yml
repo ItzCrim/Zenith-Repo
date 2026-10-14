@@ -19,10 +19,15 @@ on:
         default: north-america/us/arizona,north-america/us/nevada
         required: true
       parts:
-        description: "Complementary output ZIP count"
+        description: "Minimum number of complementary output packages"
         type: choice
-        options: ["2","4","8","16"]
+        options: ["1","2","4","8","16"]
         default: "2"
+        required: true
+      gzip_preview:
+        description: "Experimental .gph.gz tiles - temporary artifact only, no public Release"
+        type: boolean
+        default: false
         required: true
 
 permissions:
@@ -52,8 +57,8 @@ jobs:
           [[ "$INPUT_NAME" =~ ^[a-z0-9_-]{3,80}$ ]] || exit 1
           [[ "$INPUT_CATALOG" =~ ^[a-z0-9-]+(/[a-z0-9-]+)+$ ]] || exit 1
           IFS=',' read -ra REGIONS <<< "$INPUT_REGIONS"
-          (( ${#REGIONS[@]} >= 2 && ${#REGIONS[@]} <= 16 )) || {
-            echo "::error::Select 2 to 16 adjacent Geofabrik regions";exit 1;
+          (( ${#REGIONS[@]} >= 1 && ${#REGIONS[@]} <= 16 )) || {
+            echo "::error::Select 1 to 16 adjacent Geofabrik regions";exit 1;
           }
           mkdir -p pbfs
           n=0
@@ -69,7 +74,13 @@ jobs:
           done
           sha256sum pbfs/*.osm.pbf > pbfs/source-checksums.txt
           graph_hash="$(sha256sum pbfs/source-checksums.txt | cut -c1-20)"
-          echo "GRAPH_SET=route-$graph_hash" >> "$GITHUB_ENV"
+          if [[ "${{ inputs.gzip_preview }}" == "true" ]]; then
+            echo "GRAPH_SET=route-$graph_hash-gz" >> "$GITHUB_ENV"
+            echo "TILE_ENCODING=gzip" >> "$GITHUB_ENV"
+          else
+            echo "GRAPH_SET=route-$graph_hash" >> "$GITHUB_ENV"
+            echo "TILE_ENCODING=raw" >> "$GITHUB_ENV"
+          fi
           echo "GRAPH_NAME=$INPUT_NAME" >> "$GITHUB_ENV"
           echo "CATALOG=$INPUT_CATALOG" >> "$GITHUB_ENV"
       - name: Build all state boundaries in one connected Valhalla graph
@@ -77,7 +88,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tiles
-          docker run --rm --entrypoint /bin/bash \
+          # A 2-worker, 128MiB cache profile fits small extracts on
+          # standard free runners. Larger connected extracts may still OOM.
+          docker run --rm --memory=6g --cpus=2 --entrypoint /bin/bash \
             -v "$PWD:/work" -w /work \
             ghcr.io/valhalla/valhalla:3.9.0 -lc '
               set -euo pipefail
@@ -86,6 +99,21 @@ jobs:
                 --mjolnir-tile-extract /work/tiles.tar \
                 --mjolnir-timezone /work/tiles/timezones.sqlite \
                 --mjolnir-admin /work/tiles/admins.sqlite > /work/valhalla.json
+            '
+          sudo chown "$(id -u):$(id -g)" valhalla.json
+          python3 - <<'PY'
+          import json
+          path="valhalla.json"
+          with open(path) as f:d=json.load(f)
+          d["mjolnir"]["concurrency"]=2
+          d["mjolnir"]["max_cache_size"]=134217728
+          d["mjolnir"]["use_lru_mem_cache"]=True
+          with open(path,"w") as f:json.dump(d,f)
+          PY
+          docker run --rm --memory=6g --cpus=2 --entrypoint /bin/bash \
+            -v "$PWD:/work" -w /work \
+            ghcr.io/valhalla/valhalla:3.9.0 -lc '
+              set -euo pipefail
               valhalla_build_timezones > /work/tiles/timezones.sqlite
               valhalla_build_admins -c /work/valhalla.json /work/pbfs/*.osm.pbf
               valhalla_build_tiles -c /work/valhalla.json /work/pbfs/*.osm.pbf
@@ -100,13 +128,24 @@ jobs:
           python tools/package_connected_valhalla.py \
             --tiles tiles --output output \
             --name "$GRAPH_NAME" --region "$CATALOG" \
-            --parts "$PART_COUNT" --graph-set "$GRAPH_SET"
-      - name: Publish each graph part as a raw Release asset
+            --parts "$PART_COUNT" --graph-set "$GRAPH_SET" \
+            --tile-encoding "$TILE_ENCODING" --auto-max-raw-bytes 1400000000
+          cat output/tile-size-report.json
+          echo "PART_COUNT=$(cat output/parts.txt)" >> "$GITHUB_ENV"
+      - name: Upload experimental gzip graph to temporary artifact, NOT public Release
+        if: ${{ inputs.gzip_preview }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: experimental-connected-gzip-v3
+          path: output/*.crimroute
+          retention-days: 3
+          if-no-files-found: error
+      - name: Publish each raw v2 graph part as a Release asset
+        if: ${{ !inputs.gzip_preview }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          PART_COUNT: ${{ inputs.parts }}
         run: |
           set -euo pipefail
           for part in $(seq 1 "$PART_COUNT"); do
