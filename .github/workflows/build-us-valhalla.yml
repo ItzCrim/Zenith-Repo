@@ -6,6 +6,12 @@ name: Build Complete US Connected Valhalla Routing Graph
 on:
   workflow_dispatch:
     inputs:
+      runner_mode:
+        description: "Build machine: registered 128GB self-hosted or Team/Enterprise larger runner"
+        required: true
+        type: choice
+        options: ["self-hosted", "github-large"]
+        default: "self-hosted"
       min_parts:
         description: "Minimum number of complementary download packages"
         required: true
@@ -28,10 +34,11 @@ concurrency:
 
 jobs:
   build-us-connected-valhalla:
-    # IMPORTANT: This paid/configured GitHub Larger Runner must exist in the
-    # repository's Actions runners. Standard ubuntu-latest has only 14 GB
-    # disk, insufficient for a whole US Valhalla build.
-    runs-on: ubuntu-24.04-32core
+    # Self-hosted is available to personal GitHub accounts once you register
+    # a suitable machine with label zenith-us-routing. GitHub Larger Runners
+    # require an eligible paid Team/Enterprise organization and provisioning.
+    # Never silently fall back to an insufficient standard ubuntu-latest.
+    runs-on: ${{ fromJSON(inputs.runner_mode == 'self-hosted' && '["self-hosted","linux","x64","zenith-us-routing"]' || '"ubuntu-24.04-32core"') }}
     timeout-minutes: 360
     env:
       GRAPH_NAME: usa-connected
