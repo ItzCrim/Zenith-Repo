@@ -163,6 +163,74 @@ jobs:
           print("Phoenix/Tempe:",report)
           assert result==0 and 1000<metres<200000 and eta>0 and coords>3,report
           PY
+      - name: Download Tucson and World maps from same signed catalog
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,subprocess,hashlib,base64
+          c=json.load(open("upstream/data/countries.txt"))
+          root=pathlib.Path("phoenix-maps")/str(c["v"])
+          root.mkdir(parents=True,exist_ok=True)
+          def lookup(items,region):
+            for x in items:
+              if x.get("id")==region:return x
+              result=lookup(x.get("g",[]),region)
+              if result:return result
+            return None
+          for name in ("US_Arizona_Tucson","World"):
+            entry=lookup(c["g"],name)
+            assert entry is not None and 0<entry["s"]<260000000
+            dest=root/(name+".mwm")
+            url=(f"https://mapgen-fi-1.comaps.app/maps/"
+                 f"{c['map_series']}/{c['v']}/{name}.mwm")
+            subprocess.run(["curl","-fL","--retry","2","--connect-timeout","30",
+                            "--max-time","600","--max-filesize","260000000",
+                            url,"-o",str(dest)],check=True)
+            assert dest.stat().st_size==entry["s"],"MWM length mismatch: "+name
+            sha=base64.b64encode(hashlib.sha1(dest.read_bytes()).digest()).decode()
+            assert sha==entry["sha1_base64"],"MWM sha1 mismatch: "+name
+            print("Verified native CoMaps map",name,dest.stat().st_size)
+          PY
+      - name: Try a connected Phoenix-to-Tucson offline car route
+        id: arizona
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          printf '33.4484 -112.0740 32.2217 -110.9265\n' > arizona-route.txt
+          mkdir -p arizona-dumps
+          /usr/bin/time -v native-build/routes_builder_tool \
+            --data_path="$PWD/phoenix-maps" \
+            --resources_path="$PWD/upstream/data" \
+            --threads=1 --timeout=180 --vehicle_type=car \
+            --routes_file="$PWD/arizona-route.txt" \
+            --dump_path="$PWD/arizona-dumps" \
+            2>&1 | tee arizona-cross-cli.log
+          python3 - <<'PY'
+          import pathlib,struct,json
+          p=pathlib.Path("arizona-dumps/0.mapsme.dump")
+          assert p.is_file(),"No cross-region route dump"
+          with p.open("rb") as f:
+            def take(fmt):
+              data=f.read(struct.calcsize("<"+fmt))
+              assert len(data)==struct.calcsize("<"+fmt)
+              return struct.unpack("<"+fmt,data)[0]
+            code=take("i")
+            build_seconds=take("d")
+            vehicle=take("i")
+            count=take("Q")
+            assert count==2 and vehicle==0,(count,vehicle)
+            f.read(count*16)
+            n=take("Q")
+            assert n>=1
+            duration=take("d")
+            distance=take("d")
+            points=take("Q")
+          result={"result_code":code,"runtime_seconds":build_seconds,
+                  "metres":distance,"seconds":duration,"points":points}
+          pathlib.Path("arizona-cross-result.json").write_text(json.dumps(result,indent=2))
+          print("Phoenix to Tucson:",result)
+          assert code==0 and 125000<distance<320000 and 0<duration<40000 and points>100,result
+          PY
       - name: Report experimental outcome
         if: always()
         run: |
@@ -188,6 +256,12 @@ jobs:
             else
               echo "- Phoenix native route attempt: incomplete/failed; see CI step and logs"
             fi
+            if test -f arizona-cross-result.json; then
+              echo "- Phoenix to Tucson two-region route result:"
+              cat arizona-cross-result.json
+            else
+              echo "- Two-region route attempt: incomplete/failed; see CI step and logs"
+            fi
             echo "- Android JNI not yet integrated; map file used only in test runner, never redistributed"
           } >> "$GITHUB_STEP_SUMMARY"
           if test -f native-build.log; then tail -n 1000 native-build.log > build-log-tail.txt; fi
@@ -206,5 +280,7 @@ jobs:
             routes-builder-help.log
             phoenix-result.json
             phoenix-cli.log
+            arizona-cross-result.json
+            arizona-cross-cli.log
           retention-days: 3
           if-no-files-found: warn
