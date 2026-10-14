@@ -7,11 +7,29 @@ on:
   workflow_dispatch:
     inputs:
       runner_mode:
-        description: "Build machine: registered 128GB self-hosted or Team/Enterprise larger runner"
+        description: "Use an owned Linux runner (no GitHub larger-runner fees), or an eligible larger runner"
         required: true
         type: choice
         options: ["self-hosted", "github-large"]
         default: "self-hosted"
+      memory_gib:
+        description: "Approximate host RAM in GiB; build container uses 3 GiB less. 16 is unverified for all USA."
+        required: true
+        type: choice
+        options: ["8", "12", "16", "24", "32", "48", "64", "96"]
+        default: "16"
+      build_threads:
+        description: "Valhalla tile-build worker threads; fewer means lower memory and longer runtime"
+        required: true
+        type: choice
+        options: ["1", "2", "4"]
+        default: "1"
+      tile_cache_mib:
+        description: "Per-worker Valhalla tile cache in MiB (not total peak process memory)"
+        required: true
+        type: choice
+        options: ["32", "64", "128", "256"]
+        default: "64"
       min_parts:
         description: "Minimum number of complementary download packages"
         required: true
@@ -34,35 +52,58 @@ concurrency:
 
 jobs:
   build-us-connected-valhalla:
-    # Self-hosted is available to personal GitHub accounts once you register
-    # a suitable machine with label zenith-us-routing. GitHub Larger Runners
-    # require an eligible paid Team/Enterprise organization and provisioning.
-    # Never silently fall back to an insufficient standard ubuntu-latest.
+    # A registered self-hosted runner can have modest RAM and a LARGE SSD.
+    # Standard GitHub-hosted runners lack the scratch disk for this build.
+    # Larger runners require separate eligibility and may incur fees.
     runs-on: ${{ fromJSON(inputs.runner_mode == 'self-hosted' && '["self-hosted","linux","x64","zenith-us-routing"]' || '"ubuntu-24.04-32core"') }}
-    # Self-hosted builds may take most of a day; GitHub's hosted limits
-    # may still impose a shorter job duration on hosted larger runners.
-    timeout-minutes: 1440
+    # GitHub limits self-hosted jobs to five days, hosted jobs to six hours.
+    # Low-RAM national builds may still OOM, run out of disk, or exceed this.
+    timeout-minutes: ${{ inputs.runner_mode == 'self-hosted' && 7000 || 360 }}
     env:
       GRAPH_NAME: usa-connected
       CATALOG: north-america/us
       PART_MIN: ${{ inputs.min_parts }}
+      HOST_RAM_GIB: ${{ inputs.memory_gib }}
+      BUILD_THREADS: ${{ inputs.build_threads }}
+      TILE_CACHE_MIB: ${{ inputs.tile_cache_mib }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Verify this runner can handle the full US graph
+      - name: Check adjustable memory budget and large scratch disk
         shell: bash
         run: |
           set -euo pipefail
+          case "$HOST_RAM_GIB" in 8|12|16|24|32|48|64|96) ;; *) exit 1;; esac
+          case "$BUILD_THREADS" in 1|2|4) ;; *) exit 1;; esac
+          case "$TILE_CACHE_MIB" in 32|64|128|256) ;; *) exit 1;; esac
+          command -v docker >/dev/null || { echo "::error::Docker is required"; exit 1; }
           memory_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
           disk_kb=$(df -Pk "$PWD" | awk 'NR==2 {print $4}')
-          echo "Available RAM: $((memory_kb / 1024 / 1024)) GiB"
-          echo "Available disk: $((disk_kb / 1024 / 1024)) GiB"
-          if (( memory_kb < 90000000 || disk_kb < 300000000 )); then
-            echo "::error::US routing needs a larger runner (at least ~96GB RAM and ~300GB free disk)."
+          container_ram=$((HOST_RAM_GIB-3))
+          echo "Installed RAM: $((memory_kb / 1024 / 1024)) GiB"
+          echo "Requested host profile: ${HOST_RAM_GIB} GiB, Docker cap: ${container_ram} GiB"
+          echo "Build workers: $BUILD_THREADS, tile cache per worker: $TILE_CACHE_MIB MiB"
+          echo "Available scratch disk: $((disk_kb / 1024 / 1024)) GiB"
+          # RAM sizes sold as 16GB often report slightly less in /proc/meminfo.
+          if (( memory_kb < HOST_RAM_GIB * 1024 * 1024 * 90 / 100 )); then
+            echo "::error::The selected RAM profile exceeds the actual host memory."
             exit 1
           fi
+          if (( disk_kb < 300000000 )); then
+            echo "::error::At least ~286 GiB of available scratch disk is required for this experimental full-US build. This check is independent of RAM."
+            exit 1
+          fi
+          echo "CONTAINER_RAM_GIB=$container_ram" >> "$GITHUB_ENV"
+          {
+            echo "### Experimental resource budget"
+            echo "- RAM profile: ${HOST_RAM_GIB} GiB; container limit: ${container_ram} GiB"
+            echo "- Valhalla build threads: ${BUILD_THREADS}"
+            echo "- Graph cache: ${TILE_CACHE_MIB} MiB per thread"
+            echo "- Scratch free: $((disk_kb / 1024 / 1024)) GiB"
+            echo "- This is a resource cap, **not** proof that full-USA graph building can succeed at the chosen RAM level."
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Download single complete US OpenStreetMap extract
         shell: bash
         run: |
@@ -76,27 +117,66 @@ jobs:
           sha256sum pbfs/usa.osm.pbf | tee pbfs/source.sha256
           source_sha="$(cut -c1-20 pbfs/source.sha256)"
           echo "GRAPH_SET=route-usa-$source_sha" >> "$GITHUB_ENV"
-      - name: Build ONE native Valhalla graph for every US state
+      - name: Generate low-memory Valhalla build configuration
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p tiles
-          docker run --rm --memory 110g --cpus 30 --entrypoint /bin/bash \
-            -v "$PWD:/work" -w /work \
-            ghcr.io/valhalla/valhalla:3.9.0 -lc '
+          # Redirect on the host to avoid root-owned valhalla.json on Docker mounts.
+          docker run --rm --memory "${CONTAINER_RAM_GIB}g" \
+            --memory-swap "${CONTAINER_RAM_GIB}g" \
+            --cpus "$BUILD_THREADS" --entrypoint valhalla_build_config \
+            -v "$PWD:/work" -w /work ghcr.io/valhalla/valhalla:3.9.0 \
+            --mjolnir-tile-dir /work/tiles \
+            --mjolnir-tile-extract /work/valhalla_tiles.tar \
+            --mjolnir-timezone /work/tiles/timezones.sqlite \
+            --mjolnir-admin /work/tiles/admins.sqlite > valhalla.json
+          python3 - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path("valhalla.json")
+          config = json.loads(path.read_text())
+          mj = config["mjolnir"]
+          mj["concurrency"] = int(os.environ["BUILD_THREADS"])
+          mj["max_cache_size"] = int(os.environ["TILE_CACHE_MIB"]) * 1024 * 1024
+          mj["use_lru_mem_cache"] = True
+          mj["lru_mem_cache_hard_control"] = True
+          path.write_text(json.dumps(config, indent=2)+"\n")
+          print("Valhalla configuration:", {
+              key: mj[key] for key in (
+                  "concurrency", "max_cache_size",
+                  "use_lru_mem_cache", "lru_mem_cache_hard_control"
+              )
+          })
+          PY
+      - name: Build ONE connected Valhalla graph under the memory cap
+        shell: bash
+        run: |
+          set -euo pipefail
+          # One nationwide OSM input yields one coherent graph; don't merge
+          # separately compiled state graphs and claim interstate continuity.
+          set +e
+          docker run --rm --memory "${CONTAINER_RAM_GIB}g" \
+            --memory-swap "${CONTAINER_RAM_GIB}g" \
+            --cpus "$BUILD_THREADS" --entrypoint /bin/bash \
+            -v "$PWD:/work" -w /work ghcr.io/valhalla/valhalla:3.9.0 -lc '
               set -euo pipefail
-              valhalla_build_config \
-                --mjolnir-tile-dir /work/tiles \
-                --mjolnir-tile-extract /work/valhalla_tiles.tar \
-                --mjolnir-timezone /work/tiles/timezones.sqlite \
-                --mjolnir-admin /work/tiles/admins.sqlite > /work/valhalla.json
               valhalla_build_timezones > /work/tiles/timezones.sqlite
               valhalla_build_admins -c /work/valhalla.json /work/pbfs/usa.osm.pbf
               valhalla_build_tiles -c /work/valhalla.json /work/pbfs/usa.osm.pbf
               count="$(find /work/tiles -name "*.gph" | wc -l)"
               test "$count" -gt 1000
-              echo "Generated $count graph tiles from one US extract"
+              echo "Generated $count connected routing graph tiles"
             '
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            if (( status == 137 )); then
+              echo "::error::Valhalla exceeded this RAM cap (exit 137). Try a larger memory profile; cache size and threads do not bound ALL build allocations."
+            else
+              echo "::error::Valhalla build failed (exit $status). Check graph-builder logs, free disk and resource limits."
+            fi
+            exit "$status"
+          fi
       - name: Create size-balanced complementary route downloads
         shell: bash
         run: |

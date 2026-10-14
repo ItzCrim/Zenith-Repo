@@ -95,3 +95,14 @@ The priority has shifted from size-tuning visual PMTiles to reducing offline **V
 - The existing `Build Complete US Connected Valhalla Routing Graph` workflow still needs separate memory/scratch-disk evaluation. Compressing the final graph does not make the initial country-scale OSM parse and graph construction free of RAM requirements.
 
 References: [compressed benchmark + Linux native routing comparison](https://github.com/ItzCrim/Zenith-Repo/actions/runs/38539517278), [Zenith Android app branch](https://github.com/ItzCrim/Crim-s-Maps/tree/Zenith). 
+
+
+## Low-memory nationwide connected routing build (October 2026)
+
+The full-US routing builder no longer hard-requires ~128 GB RAM. Manual [Build Complete US Connected Valhalla Routing Graph](https://github.com/ItzCrim/Zenith-Repo/actions/workflows/build-us-valhalla.yml) now exposes an **experimental 8/12/16/24/32/48/64/96 GiB host-RAM profile**. Default is **16 GiB with one Valhalla build thread and a 64 MiB per-thread graph cache**. The Docker memory cap is 3 GiB below the selected host budget (e.g., 13 GiB for the 16 GiB preset) and disables container swap. The builder enables LRU caching with hard cache control, and caps container CPU use to the selected worker count. This prioritizes limited memory and low hardware cost over build speed.
+
+**Important:** The `mjolnir.max_cache_size` limit only applies to graph tiles; OSM parsing, temporary edges, graph construction and other steps can still exhaust the container budget. The 16 GiB US preset is **not validated**. Start at 16 GiB if desired; if it exits 137/OOM, escalate RAM instead of merging independently built state graphs into a nonconnected result. Valhalla still reads one nationwide OSM extract to maintain true cross-state routing.
+
+The memory reduction does **not** eliminate required scratch space. The workflow currently requires at least **300,000,000 KiB (~286 GiB)** free on the runner for PBF input, temporary build files, tiles and outgoing ZIP parts; this is a conservative preflight threshold, not a measured nationwide maximum. A machine with 16 GiB RAM and a **large SSD** is therefore eligible to *attempt* the build; ordinary free GitHub-hosted runners with small disks are not. Self-hosted jobs may run for up to 5 days under GitHub limits; the workflow timeout is set to 7,000 minutes on self-hosted, 360 minutes on GitHub-hosted large runners. There is no paid larger-runner requirement when using an existing self-hosted machine, though hardware/power costs can still apply.
+
+Completed routing releases keep their previous v2 format and one coherent graph-set semantics; this change does not touch visual map tiles. Existing compressed v3 graph experiments remain manual previews until verified with Android Valhalla Mobile.
