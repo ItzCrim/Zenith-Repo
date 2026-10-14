@@ -52,6 +52,7 @@ jobs:
                 --mjolnir-timezone /work/tiles/timezones.sqlite \
                 --mjolnir-admin /work/tiles/admins.sqlite > /work/valhalla.json
             '
+          sudo chown "$(id -u):$(id -g)" valhalla.json
           python3 - <<'PY'
           import json
           path="valhalla.json"
