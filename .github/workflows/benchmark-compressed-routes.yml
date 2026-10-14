@@ -135,6 +135,68 @@ jobs:
           print(msg)
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:f.write(msg)
           PY
+      - name: Verify Valhalla serves identical driving routes from raw and gzip graphs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib,zipfile,copy
+          cfg=json.loads(pathlib.Path("valhalla.json").read_text())
+          for mode in ("raw","gzip"):
+              archive=next((pathlib.Path("output")/mode).glob("*.crimroute"))
+              tiles=pathlib.Path("graphs")/mode
+              tiles.mkdir(parents=True,exist_ok=True)
+              with zipfile.ZipFile(archive) as zip:
+                  for entry in zip.namelist():
+                      if entry=="manifest.json":continue
+                      assert entry.startswith("tiles/")
+                      out=tiles/entry.removeprefix("tiles/")
+                      out.parent.mkdir(parents=True,exist_ok=True)
+                      with zip.open(entry) as src,out.open("wb") as dst:
+                          import shutil
+                          shutil.copyfileobj(src,dst)
+              conf=copy.deepcopy(cfg)
+              conf["mjolnir"]["tile_dir"]="/work/graphs/"+mode
+              conf["mjolnir"]["tile_extract"]=""
+              pathlib.Path(mode+".json").write_text(json.dumps(conf))
+          PY
+          for mode in raw gzip; do
+            docker run --rm --network host --memory=6g --cpus=2 \
+              -v "$PWD:/work" -w /work ghcr.io/valhalla/valhalla:3.9.0 \
+              valhalla_service "/work/${mode}.json" 1 > "${mode}.log" 2>&1 &
+            pid=$!
+            trap 'kill "$pid" 2>/dev/null || true' EXIT
+            ready=0
+            for attempt in $(seq 1 40); do
+              if curl -fsS --max-time 2 http://127.0.0.1:8002/status > /dev/null 2>&1; then
+                ready=1; break
+              fi
+              if ! kill -0 "$pid" 2>/dev/null; then break; fi
+              sleep 2
+            done
+            if [ "$ready" -ne 1 ]; then
+              tail -90 "${mode}.log"
+              echo "::error::Valhalla service failed to start on the ${mode} tiles"
+              exit 1
+            fi
+            curl -fsS --max-time 60 -X POST http://127.0.0.1:8002/route \
+              -H 'Content-Type: application/json' \
+              --data '{"locations":[{"lat":39.7460,"lon":-75.5470},{"lat":39.7300,"lon":-75.5660}],"costing":"auto","units":"kilometers"}' \
+              > "${mode}-route.json"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" || true
+            trap - EXIT
+          done
+          python3 - <<'PY'
+          import json
+          left=json.load(open("raw-route.json"))["trip"]
+          right=json.load(open("gzip-route.json"))["trip"]
+          assert left["legs"] and right["legs"]
+          assert left["legs"][0]["shape"]==right["legs"][0]["shape"],"Route geometry changed"
+          assert abs(left["summary"]["length"]-right["summary"]["length"])<0.001
+          assert abs(left["summary"]["time"]-right["summary"]["time"])<0.01
+          print("Native Valhalla Linux smoke test: identical raw/gzip driving route")
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: experimental-valhalla-gzip-v3-and-raw-v2
