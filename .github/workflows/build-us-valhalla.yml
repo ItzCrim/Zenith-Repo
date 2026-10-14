@@ -148,13 +148,10 @@ jobs:
               )
           })
           PY
-      - name: Build ONE connected Valhalla graph under the memory cap
+      - name: Prepare nationwide graph metadata under memory cap
         shell: bash
         run: |
           set -euo pipefail
-          # One nationwide OSM input yields one coherent graph; don't merge
-          # separately compiled state graphs and claim interstate continuity.
-          set +e
           docker run --rm --memory "${CONTAINER_RAM_GIB}g" \
             --memory-swap "${CONTAINER_RAM_GIB}g" \
             --cpus "$BUILD_THREADS" --entrypoint /bin/bash \
@@ -162,21 +159,49 @@ jobs:
               set -euo pipefail
               valhalla_build_timezones > /work/tiles/timezones.sqlite
               valhalla_build_admins -c /work/valhalla.json /work/pbfs/usa.osm.pbf
-              valhalla_build_tiles -c /work/valhalla.json /work/pbfs/usa.osm.pbf
-              count="$(find /work/tiles -name "*.gph" | wc -l)"
-              test "$count" -gt 1000
-              echo "Generated $count connected routing graph tiles"
             '
-          status=$?
-          set -e
-          if (( status != 0 )); then
-            if (( status == 137 )); then
-              echo "::error::Valhalla exceeded this RAM cap (exit 137). Try a larger memory profile; cache size and threads do not bound ALL build allocations."
-            else
-              echo "::error::Valhalla build failed (exit $status). Check graph-builder logs, free disk and resource limits."
+      - name: Build ONE connected US graph in sequential low-memory stages
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Stages run in separate Docker processes so caches/heaps are freed
+          # between stages. They all reuse the same nationwide PBF and tile
+          # directory; output is still one connected US graph.
+          stages=(
+            "initialize parseways"
+            "parserelations parserelations"
+            "parsenodes parsenodes"
+            "build cleanup"
+          )
+          for pair in "${stages[@]}"; do
+            read -r begin end <<< "$pair"
+            echo "::group::Valhalla stage $begin -> $end"
+            echo "Scratch free: $(df -h "$PWD" | tail -n 1)"
+            set +e
+            docker run --rm --memory "${CONTAINER_RAM_GIB}g" \
+              --memory-swap "${CONTAINER_RAM_GIB}g" \
+              --cpus "$BUILD_THREADS" --entrypoint valhalla_build_tiles \
+              -v "$PWD:/work" -w /work ghcr.io/valhalla/valhalla:3.9.0 \
+              -c /work/valhalla.json -s "$begin" -e "$end" \
+              /work/pbfs/usa.osm.pbf
+            status=$?
+            set -e
+            echo "::endgroup::"
+            if (( status != 0 )); then
+              if (( status == 137 )); then
+                echo "::error::OOM in Valhalla stage $begin -> $end (exit 137). Increase the RAM profile or inspect stage-specific allocations; the tile cache is not a global limit."
+              else
+                echo "::error::Valhalla stage $begin -> $end failed (exit $status). Inspect Docker/OSM build output."
+              fi
+              exit "$status"
             fi
-            exit "$status"
-          fi
+          done
+          count="$(find tiles -name "*.gph" | wc -l)"
+          test "$count" -gt 1000 || {
+            echo "::error::Too few graph tiles ($count); refusing to package incomplete US routes"
+            exit 1
+          }
+          echo "Built $count native routing tiles from ONE nationwide graph"
       - name: Create size-balanced complementary route downloads
         shell: bash
         run: |
