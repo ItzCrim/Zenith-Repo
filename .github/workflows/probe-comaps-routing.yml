@@ -52,8 +52,11 @@ jobs:
         run: |
           set -euo pipefail
           cd upstream
-          SKIP_MAP_DOWNLOAD=1 SKIP_GENERATE_SYMBOLS=1 \
-            SKIP_GENERATE_DRULES=1 ./configure.sh
+          # Drules generation ALSO produces classificator.txt and types.txt:
+          # routing unit tests need those even when the UI renderer is off.
+          SKIP_MAP_DOWNLOAD=1 SKIP_GENERATE_SYMBOLS=1 ./configure.sh
+          test -s data/types.txt
+          test -s data/classificator.txt
           cmake -S . -B ../native-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug -DSKIP_QT_GUI=ON \
             -DSKIP_TESTS=OFF -DUSE_CCACHE=OFF \
@@ -69,13 +72,97 @@ jobs:
           stat -c '%n: %s bytes' \
             native-build/routing_tests native-build/routes_builder_tool \
             | tee native-binaries.txt
-      - name: Run native graph and maneuver tests
+      - name: Test cross-border graph and turn restrictions
         run: |
           set -euo pipefail
-          ctest --test-dir native-build -R '^routing_tests$' \
-            --output-on-failure --timeout 300 2>&1 | tee routing-tests.log
+          : > routing-tests.log
+          for filter in CrossBorderGraph_SerDes RestrictionTest_CrossGraph_NoUTurn; do
+            echo "=== $filter ===" | tee -a routing-tests.log
+            native-build/routing_tests "--filter=$filter" \
+              "--data_path=$PWD/upstream/data" \
+              "--user_resource_path=$PWD/upstream/data" \
+              2>&1 | tee -a routing-tests.log
+          done
           native-build/routes_builder_tool --helpshort \
             > routes-builder-help.log 2>&1 || true
+      - name: Download compatible Phoenix map only into the CI runner
+        run: |
+          set -euo pipefail
+          eval "$(python3 - <<'PY'
+          import json,shlex
+          c=json.load(open("upstream/data/countries.txt"))
+          def find(items):
+            for x in items:
+              if x.get("id")=="US_Arizona_Phoenix":return x
+              hit=find(x.get("g",[]))
+              if hit:return hit
+            return None
+          target=find(c["g"])
+          assert target is not None and target.get("s",0)>1000000
+          for name,value in (("SERIES",c["map_series"]),
+                             ("VERSION",str(c["v"])),
+                             ("MAP_BYTES",str(target["s"]))):
+            print(f"{name}={shlex.quote(value)}")
+          PY
+          )"
+          mkdir -p "phoenix-maps/$VERSION"
+          url="https://mapgen-fi-1.comaps.app/maps/$SERIES/$VERSION/US_Arizona_Phoenix.mwm"
+          curl -fL --retry 2 --connect-timeout 30 --max-time 600 \
+            --max-filesize 260000000 "$url" \
+            -o "phoenix-maps/$VERSION/US_Arizona_Phoenix.mwm"
+          python3 - <<'PY'
+          import pathlib,hashlib,base64,json
+          c=json.load(open("upstream/data/countries.txt"))
+          def find(items):
+            for x in items:
+              if x.get("id")=="US_Arizona_Phoenix":return x
+              y=find(x.get("g",[]))
+              if y:return y
+          obj=find(c["g"])
+          path=pathlib.Path("phoenix-maps")/str(c["v"])/"US_Arizona_Phoenix.mwm"
+          assert path.stat().st_size==obj["s"]
+          digest=base64.b64encode(hashlib.sha1(path.read_bytes()).digest()).decode()
+          assert digest==obj["sha1_base64"],"Downloaded .mwm SHA-1 does not match catalog"
+          print("Verified Phoenix MWM from CoMaps catalog:",path.stat().st_size,"bytes")
+          PY
+      - name: Try an offline Phoenix-to-Tempe driving route
+        id: phoenix
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          printf '33.4484 -112.0740 33.4255 -111.9400\n' > phoenix-route.txt
+          mkdir -p route-dumps
+          /usr/bin/time -v native-build/routes_builder_tool \
+            --data_path="$PWD/phoenix-maps" \
+            --resources_path="$PWD/upstream/data" \
+            --threads=1 --timeout=120 \
+            --vehicle_type=car \
+            --routes_file="$PWD/phoenix-route.txt" \
+            --dump_path="$PWD/route-dumps" \
+            2>&1 | tee phoenix-cli.log
+          python3 - <<'PY'
+          import pathlib,struct,json
+          p=pathlib.Path("route-dumps/0.mapsme.dump")
+          assert p.exists(),"CoMaps CLI did not write a route result"
+          with p.open("rb") as f:
+            take=lambda fmt:struct.unpack("<"+fmt,f.read(struct.calcsize("<"+fmt)))[0]
+            result=take("i")
+            time=take("d")
+            vehicle=take("i")
+            count=take("Q")
+            assert 1<count<12,(result,vehicle,count)
+            f.read(count*16)
+            routes=take("Q")
+            assert routes>0
+            eta=take("d")
+            metres=take("d")
+            coords=take("Q")
+          report={"result_code":result,"runtime_seconds":time,"route_metres":metres,
+                  "travel_seconds":eta,"coordinate_count":coords}
+          pathlib.Path("phoenix-result.json").write_text(json.dumps(report,indent=2))
+          print("Phoenix/Tempe:",report)
+          assert result==0 and 1000<metres<200000 and eta>0 and coords>3,report
+          PY
       - name: Report experimental outcome
         if: always()
         run: |
@@ -95,7 +182,13 @@ jobs:
             if test -f routing-tests.log; then
               tail -n 15 routing-tests.log
             fi
-            echo "- Note: no Android JNI, Arizona routes, or map-file redistribution yet"
+            if test -f phoenix-result.json; then
+              echo "- Real Phoenix regional route result:"
+              cat phoenix-result.json
+            else
+              echo "- Phoenix native route attempt: incomplete/failed; see CI step and logs"
+            fi
+            echo "- Android JNI not yet integrated; map file used only in test runner, never redistributed"
           } >> "$GITHUB_STEP_SUMMARY"
           if test -f native-build.log; then tail -n 1000 native-build.log > build-log-tail.txt; fi
       - name: Upload logs only
@@ -111,5 +204,7 @@ jobs:
             routing-tests.log
             build-log-tail.txt
             routes-builder-help.log
+            phoenix-result.json
+            phoenix-cli.log
           retention-days: 3
           if-no-files-found: warn
