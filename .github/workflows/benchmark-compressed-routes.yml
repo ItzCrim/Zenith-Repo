@@ -1,0 +1,146 @@
+name: Benchmark Compressed Valhalla Routing
+
+# Safe zero-release experiment: builds one SMALL connected routing graph on
+# a standard hosted runner and publishes temporary artifacts, never Releases.
+on:
+  push:
+    paths:
+      - tools/package_connected_valhalla.py
+      - .github/workflows/benchmark-compressed-routes.yml
+  workflow_dispatch:
+    inputs:
+      region:
+        description: Small routing extract to benchmark
+        type: choice
+        required: true
+        options:
+          - north-america/us/delaware
+          - north-america/us/rhode-island
+          - north-america/us/vermont
+        default: north-america/us/delaware
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download small OSM source
+        shell: bash
+        env:
+          REGION: ${{ inputs.region || 'north-america/us/delaware' }}
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --max-time 1200 --connect-timeout 30 \
+            "https://download.geofabrik.de/${REGION}-latest.osm.pbf" \
+            -o source.osm.pbf
+          test -s source.osm.pbf
+      - name: Configure memory-limited Valhalla graph builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tiles
+          docker run --rm --memory=6g --cpus=2 --entrypoint /bin/bash \
+            -v "$PWD:/work" -w /work ghcr.io/valhalla/valhalla:3.9.0 -lc '
+              set -euo pipefail
+              valhalla_build_config \
+                --mjolnir-tile-dir /work/tiles \
+                --mjolnir-tile-extract /work/tiles.tar \
+                --mjolnir-timezone /work/tiles/timezones.sqlite \
+                --mjolnir-admin /work/tiles/admins.sqlite > /work/valhalla.json
+            '
+          python3 - <<'PY'
+          import json
+          path="valhalla.json"
+          with open(path) as f: data=json.load(f)
+          data["mjolnir"]["concurrency"]=2
+          data["mjolnir"]["max_cache_size"]=134217728
+          data["mjolnir"]["use_lru_mem_cache"]=True
+          with open(path,"w") as f:json.dump(data,f)
+          PY
+      - name: Build sample graph with two workers and bounded cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --memory=6g --cpus=2 --entrypoint /bin/bash \
+            -v "$PWD:/work" -w /work ghcr.io/valhalla/valhalla:3.9.0 -lc '
+              set -euo pipefail
+              valhalla_build_timezones > /work/tiles/timezones.sqlite
+              valhalla_build_admins -c /work/valhalla.json /work/source.osm.pbf
+              valhalla_build_tiles -c /work/valhalla.json /work/source.osm.pbf
+              test "$(find /work/tiles -name "*.gph" | wc -l)" -gt 5
+            '
+      - name: Package existing raw v2 and compressed v3 graphs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/package_connected_valhalla.py \
+            --tiles tiles --output output/raw --name test-raw --region north-america/us/test \
+            --graph-set route-test-raw --parts 1 --tile-encoding raw
+          python3 tools/package_connected_valhalla.py \
+            --tiles tiles --output output/gzip --name test-gzip --region north-america/us/test \
+            --graph-set route-test-gzip --parts 1 --tile-encoding gzip
+      - name: Verify ALL tile bytes, CRC and size savings
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import gzip,hashlib,json,pathlib,zipfile,os
+          root=pathlib.Path("tiles")
+          summaries={}
+          for kind in ("raw","gzip"):
+              output=pathlib.Path("output")/kind
+              package=next(output.glob("*.crimroute"))
+              report=json.loads((output/"tile-size-report.json").read_text())
+              hashes=set()
+              with zipfile.ZipFile(package) as z:
+                  assert z.testzip() is None
+                  manifest=json.loads(z.read("manifest.json"))
+                  assert manifest["tile_count"]==len(z.namelist())-1
+                  assert manifest["format"]==("crims-valhalla-tiles-v3" if kind=="gzip" else "crims-valhalla-tiles-v2")
+                  for entry in z.namelist():
+                      if entry=="manifest.json":continue
+                      assert entry.startswith("tiles/")
+                      relative=entry[len("tiles/"):]
+                      if kind=="gzip":
+                          assert relative.endswith(".gph.gz")
+                          relative=relative[:-3]
+                          blob=gzip.decompress(z.read(entry))
+                      else:
+                          assert relative.endswith(".gph")
+                          blob=z.read(entry)
+                      expected=(root/relative).read_bytes()
+                      assert hashlib.sha256(blob).digest()==hashlib.sha256(expected).digest(),relative
+                      hashes.add(relative)
+              assert len(hashes)==manifest["tile_count"]
+              summaries[kind]=(report,package.stat().st_size)
+          before=summaries["raw"][0]["raw_tile_bytes"]
+          after=summaries["gzip"][0]["installed_tile_bytes"]
+          assert before==summaries["gzip"][0]["raw_tile_bytes"]
+          assert 0<after<before, "Compressed routing graph was not smaller"
+          percent=100*(before-after)/before
+          msg=(
+            "## Valhalla gzip routing storage benchmark\n\n"
+            f"Raw graph tiles: {before/1048576:.2f} MiB\n\n"
+            f"Gzipped installed tiles: {after/1048576:.2f} MiB\n\n"
+            f"Installed storage reduction: {percent:.2f}%\n\n"
+            f"Raw v2 download: {summaries['raw'][1]/1048576:.2f} MiB\n\n"
+            f"Gzip v3 download: {summaries['gzip'][1]/1048576:.2f} MiB\n\n"
+            "Every tile round-tripped byte-identically. "
+            "Android native route compatibility still needs a device test.\n"
+          )
+          print(msg)
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:f.write(msg)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: experimental-valhalla-gzip-v3-and-raw-v2
+          path: |
+            output/raw/*.crimroute
+            output/gzip/*.crimroute
+            output/raw/tile-size-report.json
+            output/gzip/tile-size-report.json
+          retention-days: 3
+          if-no-files-found: error
