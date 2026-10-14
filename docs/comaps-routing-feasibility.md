@@ -52,6 +52,31 @@ Zenith's storage until we measure equivalent coverage.
 
 Catalog source: https://github.com/comaps/comaps/blob/main/data/countries.txt
 
+## Verified probe 1 (GitHub Actions 38546793403)
+
+The headless C++ build on the standard ubuntu-latest Actions runner
+**succeeded** for both `routing_tests` and `routes_builder_tool`.
+The native compile step took 4 minutes 12.73 seconds with a measured
+peak *build-command* RSS of 2,620,236 KiB (~2.5 GiB), and 105
+Ninja build steps. The DEBUG executables are 241,927,224 and
+143,589,320 bytes respectively. These are unstripped *debug* binaries,
+not estimates of an Android .so or a production APK.
+
+The original unit test invocation failed immediately when it could not
+find `data/types.txt`: the probe deliberately skipped rendering
+resource generation, not realizing it also produces **routing-required**
+classifier resources. This is an experiment configuration failure,
+not a native routing compile error. The revised probe enables that
+resource generation and attempts the selected unit tests plus a
+checksum-verified Phoenix regional .mwm route.
+
+**Important qualification:** Although the build sets
+`SKIP_QT_GUI=ON`, it still compiles the upstream static `drape`
+library as a transitive dependency of the combined test targets.
+We have NOT proven a minimal JNI library can exclude all renderer code.
+
+Logs: https://github.com/ItzCrim/Zenith-Repo/actions/runs/38546793403
+
 ## Trial sequence and no-go criteria
 
 1. **Independent native compile:** clone a pinned CoMaps source revision and
