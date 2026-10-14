@@ -81,3 +81,17 @@ Up to three routing archives are **downloaded simultaneously**, with no arbitrar
 The optional `runner_mode=github-large` uses an explicitly configured 32-core GitHub Larger Runner (`ubuntu-24.04-32core`). As of October 2026, that option is available only to eligible GitHub Team/Enterprise organizations with a configured paid larger runner; personal GitHub repositories do not automatically have access. No nationwide build has been run or its success verified yet.
 
 Even with a large runner, US graph computation can exceed the workflow's six-hour job deadline or source/machine limits; this configuration is an informed starting point, **not a guarantee**. A full-USA routing archive needs many gigabytes of phone storage in addition to PMTiles basemaps. Zenith requires **all parts** of a graph set before enabling the connected native Valhalla graph; already-published map data remains unchanged.
+
+
+## Routing-first storage optimization (experimental, October 2026)
+
+The priority has shifted from size-tuning visual PMTiles to reducing offline **Valhalla graph** storage. The released zoom-14 map files are unchanged.
+
+- The experimental routing package creator supports `--tile-encoding gzip`: it compresses tiles one at a time with deterministic gzip timestamps, puts them in a v3 `.crimroute` ZIP without double compression, and validates the package/manifest. The default `--tile-encoding raw` continues to output v2 archives unchanged.
+- **Measured Delaware comparison:** 51.44 MiB uncompressed routing tiles became 19.20 MiB on disk with gzip (**62.68% less permanent graph storage**). Both transfer ZIPs were approximately 19.20 MiB; the savings are from avoiding a full decompression at installation. Every compressed tile reproduced the original bytes.
+- Native Valhalla 3.9.0 on Linux successfully calculated the same driving route from both raw and gzip graphs, with matching geometry, distance, and duration. The on-device Valhalla Mobile 0.6.4 test is still required for production.
+- Run `Benchmark Compressed Valhalla Routing` manually to repeat the small-region comparison. It operates on a free hosted runner with 6 GB Docker RAM budget, two workers and a 128 MiB graph cache per worker, and publishes **temporary GitHub Actions artifacts only**, never replaces existing public route Releases.
+- `Build Connected Valhalla Routes` also supports 1–16 neighboring source extracts with the bounded two-worker builder. When `gzip_preview=true`, it uploads v3 output to a short-lived artifact rather than the public routing catalog. Use this for a **small-region** preview only. Standard hosted runners are not demonstrated to handle the entire USA.
+- The existing `Build Complete US Connected Valhalla Routing Graph` workflow still needs separate memory/scratch-disk evaluation. Compressing the final graph does not make the initial country-scale OSM parse and graph construction free of RAM requirements.
+
+References: [compressed benchmark + Linux native routing comparison](https://github.com/ItzCrim/Zenith-Repo/actions/runs/38539517278), [Zenith Android app branch](https://github.com/ItzCrim/Crim-s-Maps/tree/Zenith). 

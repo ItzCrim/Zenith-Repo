@@ -2,11 +2,8 @@ name: Benchmark Compressed Valhalla Routing
 
 # Safe zero-release experiment: builds one SMALL connected routing graph on
 # a standard hosted runner and publishes temporary artifacts, never Releases.
+# After initial successful benchmark and Linux route parity check, manual-only.
 on:
-  push:
-    paths:
-      - tools/package_connected_valhalla.py
-      - .github/workflows/benchmark-compressed-routes.yml
   workflow_dispatch:
     inputs:
       region:
