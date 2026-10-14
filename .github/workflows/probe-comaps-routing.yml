@@ -1,0 +1,115 @@
+name: Probe CoMaps Headless Routing Core
+
+# No production Zenith changes; no redistribution of upstream native binaries.
+on:
+  push:
+    paths:
+      - .github/workflows/probe-comaps-routing.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  headless-router:
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native routing dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build qt6-base-dev qt6-svg-dev \
+            qt6-positioning-dev libicu-dev libfreetype-dev \
+            libharfbuzz-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev optipng python3-venv \
+            python3-pip python-is-python3 jq curl
+      - name: Clone CoMaps C++ core and submodules
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --filter=blob:none \
+            https://github.com/comaps/comaps.git upstream
+          git -C upstream rev-parse HEAD | tee upstream-commit.txt
+          cd upstream
+          git submodule update --init --recursive --depth 1 --jobs 3
+          du -sh . | tee ../source-size.txt
+      - name: Audit route-core dependencies
+        run: |
+          set -euo pipefail
+          {
+            echo "CoMaps revision: $(cat upstream-commit.txt)"
+            sed -n '/target_link_libraries/,$p' upstream/libs/routing/CMakeLists.txt | head -45
+            grep -nE 'DataSource|IndexRouter[(]' upstream/libs/routing/index_router.hpp | head -25
+            cat upstream/libs/routing/routes_builder/routes_builder_tool/CMakeLists.txt
+            grep -n 'UNIT_TEST(CrossBorderGraph_' \
+              upstream/libs/routing/routing_tests/cross_border_graph_tests.cpp
+            grep -nE 'CalculateRoute[(]|GetTurn[(]|GetRoadNameInfo[(]' \
+              upstream/libs/routing/{index_router.hpp,route.hpp} | head -25
+          } | tee architecture-report.txt
+      - name: Configure native C++ targets with Qt GUI disabled
+        run: |
+          set -euo pipefail
+          cd upstream
+          SKIP_MAP_DOWNLOAD=1 SKIP_GENERATE_SYMBOLS=1 \
+            SKIP_GENERATE_DRULES=1 ./configure.sh
+          cmake -S . -B ../native-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug -DSKIP_QT_GUI=ON \
+            -DSKIP_TESTS=OFF -DUSE_CCACHE=OFF \
+            -DCMAKE_UNITY_BUILD=ON
+      - name: Compile routing tests and offline CLI
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v cmake --build native-build \
+            --target routing_tests routes_builder_tool --parallel 2 \
+            2>&1 | tee native-build.log
+          test -x native-build/routing_tests
+          test -x native-build/routes_builder_tool
+          stat -c '%n: %s bytes' \
+            native-build/routing_tests native-build/routes_builder_tool \
+            | tee native-binaries.txt
+      - name: Run native graph and maneuver tests
+        run: |
+          set -euo pipefail
+          ctest --test-dir native-build -R '^routing_tests$' \
+            --output-on-failure --timeout 300 2>&1 | tee routing-tests.log
+          native-build/routes_builder_tool --helpshort \
+            > routes-builder-help.log 2>&1 || true
+      - name: Report experimental outcome
+        if: always()
+        run: |
+          {
+            echo "## Zenith / CoMaps routing-core proof"
+            echo "- Upstream: https://github.com/comaps/comaps"
+            if test -f upstream-commit.txt; then
+              echo "- Commit: $(cat upstream-commit.txt)"
+            fi
+            echo "- Tested targets: routing_tests, routes_builder_tool"
+            if test -f native-binaries.txt; then
+              echo "- Native core compiled: YES"
+              cat native-binaries.txt
+            else
+              echo "- Native core compiled: NOT YET / FAILED"
+            fi
+            if test -f routing-tests.log; then
+              tail -n 15 routing-tests.log
+            fi
+            echo "- Note: no Android JNI, Arizona routes, or map-file redistribution yet"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if test -f native-build.log; then tail -n 1000 native-build.log > build-log-tail.txt; fi
+      - name: Upload logs only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: comaps-routing-feasibility-logs
+          path: |
+            upstream-commit.txt
+            source-size.txt
+            architecture-report.txt
+            native-binaries.txt
+            routing-tests.log
+            build-log-tail.txt
+            routes-builder-help.log
+          retention-days: 3
+          if-no-files-found: warn
