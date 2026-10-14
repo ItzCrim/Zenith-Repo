@@ -2,9 +2,6 @@ name: Benchmark Lean Zoom-14 Basemap
 
 # Manual test. Never replaces published PMTiles assets.
 on:
-  push:
-    branches: [main]
-    paths: [".github/workflows/benchmark-lean-map.yml"]
   workflow_dispatch:
     inputs:
       region:
