@@ -1,0 +1,126 @@
+name: Build Complete US Connected Valhalla Routing Graph
+
+# All 50 states (including Alaska and Hawaii) come from ONE Geofabrik US
+# source, resulting in ONE coherent Valhalla graph. Shards are distribution
+# files, never independently compiled routing graphs.
+on:
+  workflow_dispatch:
+    inputs:
+      min_parts:
+        description: "Minimum number of complementary download packages"
+        required: true
+        type: choice
+        options: ["32", "64", "96", "128"]
+        default: "64"
+      source:
+        description: "USA source coverage"
+        required: true
+        type: choice
+        options: ["north-america/us"]
+        default: "north-america/us"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: us-valhalla-connected-z1
+  cancel-in-progress: false
+
+jobs:
+  build-us-connected-valhalla:
+    # IMPORTANT: This paid/configured GitHub Larger Runner must exist in the
+    # repository's Actions runners. Standard ubuntu-latest has only 14 GB
+    # disk, insufficient for a whole US Valhalla build.
+    runs-on: ubuntu-24.04-32core
+    timeout-minutes: 360
+    env:
+      GRAPH_NAME: usa-connected
+      CATALOG: north-america/us
+      PART_MIN: ${{ inputs.min_parts }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify this runner can handle the full US graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          memory_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+          disk_kb=$(df -Pk "$PWD" | awk 'NR==2 {print $4}')
+          echo "Available RAM: $((memory_kb / 1024 / 1024)) GiB"
+          echo "Available disk: $((disk_kb / 1024 / 1024)) GiB"
+          if (( memory_kb < 90000000 || disk_kb < 300000000 )); then
+            echo "::error::US routing needs a larger runner (at least ~96GB RAM and ~300GB free disk)."
+            exit 1
+          fi
+      - name: Download single complete US OpenStreetMap extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pbfs
+          curl --fail --location --retry 5 --retry-delay 20 --connect-timeout 60 \
+            --speed-time 120 --speed-limit 1000 --max-time 10800 \
+            "https://download.geofabrik.de/north-america/us-latest.osm.pbf" \
+            -o pbfs/usa.osm.pbf
+          test -s pbfs/usa.osm.pbf
+          sha256sum pbfs/usa.osm.pbf | tee pbfs/source.sha256
+          source_sha="$(cut -c1-20 pbfs/source.sha256)"
+          echo "GRAPH_SET=route-usa-$source_sha" >> "$GITHUB_ENV"
+      - name: Build ONE native Valhalla graph for every US state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tiles
+          docker run --rm --memory 110g --cpus 30 --entrypoint /bin/bash \
+            -v "$PWD:/work" -w /work \
+            ghcr.io/valhalla/valhalla:3.9.0 -lc '
+              set -euo pipefail
+              valhalla_build_config \
+                --mjolnir-tile-dir /work/tiles \
+                --mjolnir-tile-extract /work/valhalla_tiles.tar \
+                --mjolnir-timezone /work/tiles/timezones.sqlite \
+                --mjolnir-admin /work/tiles/admins.sqlite > /work/valhalla.json
+              valhalla_build_timezones > /work/tiles/timezones.sqlite
+              valhalla_build_admins -c /work/valhalla.json /work/pbfs/usa.osm.pbf
+              valhalla_build_tiles -c /work/valhalla.json /work/pbfs/usa.osm.pbf
+              count="$(find /work/tiles -name "*.gph" | wc -l)"
+              test "$count" -gt 1000
+              echo "Generated $count graph tiles from one US extract"
+            '
+      - name: Create size-balanced complementary route downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/package_connected_valhalla.py \
+            --tiles tiles --output output \
+            --name "$GRAPH_NAME" --region "$CATALOG" \
+            --graph-set "$GRAPH_SET" --parts "$PART_MIN" \
+            --auto-max-raw-bytes 1400000000
+          count="$(cat output/parts.txt)"
+          test "$count" -ge "$PART_MIN"
+          test "$count" -le 128
+          echo "PART_COUNT=$count" >> "$GITHUB_ENV"
+          echo "Publishing $count pieces of one fully connected US graph"
+      - name: Publish every part into Zenith-Repo Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for index in $(seq 1 "$PART_COUNT"); do
+            file="$GRAPH_NAME-part-$index.crimroute"
+            tag="route-$GRAPH_NAME-v2-$GRAPH_SET-part-$index"
+            test -s "output/$file"
+            test -s "output/$file.sha256"
+            notes="Entire United States Valhalla routing graph. Source: Geofabrik OpenStreetMap data (north-america/us), compiled TOGETHER as one graph. Compatible graph_set=$GRAPH_SET. ALL $PART_COUNT complementary packages are REQUIRED for full-US interstate routing. © OpenStreetMap contributors, ODbL 1.0."
+            if ! gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+              gh release create "$tag" --repo "$GH_REPO" --latest=false \
+                --title "Zenith US Valhalla routes — part $index of $PART_COUNT" \
+                --notes "$notes"
+            fi
+            gh release upload "$tag" --repo "$GH_REPO" \
+              "output/$file" "output/$file.sha256" --clobber
+          done
+          echo "Published $PART_COUNT compatible routing packages to $GH_REPO"
