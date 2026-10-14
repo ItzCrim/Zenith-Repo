@@ -70,3 +70,14 @@ Nunavut's full PBF approaches the workflow's input size limit; the North America
 This is different from the old `.crimroute` v1 workflow, which compiles each state separately and cannot reliably route across state borders. The new `crims-valhalla-tiles-v2` format includes a `graph_set` identity and required part count; the app stores route ZIPs independently and expands compatible shards into one native Valhalla tile directory. It only activates a set when **all parts** have arrived.
 
 Up to three routing archives are **downloaded simultaneously**, with no arbitrary three-pack storage limit. Building a full-US graph may require a much larger runner than GitHub's standard hosted runners. Do not combine independently built graph shards merely because their paths look compatible.
+
+
+## One-click US-wide *connected* Valhalla route building
+
+[Build Complete US Connected Valhalla Routing Graph](https://github.com/ItzCrim/Zenith-Repo/actions/workflows/build-us-valhalla.yml) is a **single manual workflow** that downloads Geofabrik's `north-america/us-latest.osm.pbf` (all 50 states), compiles ONE Valhalla routing graph, automatically divides its loose routing tiles into approximately 1.4 GB-or-smaller groups, verifies ZIPs and SHA-256 files, and publishes the complementary `.crimroute` parts to this repository's GitHub Releases.
+
+**Prerequisite: a sufficiently powerful Actions runner.** Standard free GitHub-hosted machines are too small (public Linux runners have about 16 GB RAM and 14 GB storage). The workflow deliberately does not start a doomed full-USA build on them. On a personal GitHub account, register a large cloud/owned Linux x64 Actions runner with labels `self-hosted, linux, x64, zenith-us-routing`, and at least **~128 GB RAM and 350+ GB free SSD** (preferably more). The workflow checks resources before starting. In GitHub Settings → Actions → Runners, use **New self-hosted runner** on a machine you control; do not add GitHub's runner registration token to the repository. Personal-account users should choose `runner_mode=self-hosted`.
+
+The optional `runner_mode=github-large` uses an explicitly configured 32-core GitHub Larger Runner (`ubuntu-24.04-32core`). As of October 2026, that option is available only to eligible GitHub Team/Enterprise organizations with a configured paid larger runner; personal GitHub repositories do not automatically have access. No nationwide build has been run or its success verified yet.
+
+Even with a large runner, US graph computation can exceed the workflow's six-hour job deadline or source/machine limits; this configuration is an informed starting point, **not a guarantee**. A full-USA routing archive needs many gigabytes of phone storage in addition to PMTiles basemaps. Zenith requires **all parts** of a graph set before enabling the connected native Valhalla graph; already-published map data remains unchanged.
