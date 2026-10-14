@@ -1,0 +1,88 @@
+name: Benchmark Lean Zoom-14 Basemap
+
+# Manual test. Never replaces published PMTiles assets.
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "Small existing US zoom-14 map for a non-destructive size test"
+        type: choice
+        options: ["north-america/us/delaware", "north-america/us/rhode-island", "north-america/us/vermont"]
+        default: "north-america/us/delaware"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download current baseline and source data
+        shell: bash
+        env:
+          REGION: ${{ inputs.region }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          name="$(basename "$REGION")"
+          tag="map-$(echo "$REGION" | tr / -)-z14"
+          mkdir -p output
+          gh release download "$tag" --repo "$GH_REPO" \
+            --pattern "$name.pmtiles" --dir output
+          mv "output/$name.pmtiles" output/baseline.pmtiles
+          curl --fail --location --retry 3 --connect-timeout 40 \
+            --max-time 2100 "https://download.geofabrik.de/$REGION-latest.osm.pbf" \
+            -o region.osm.pbf
+          test -s region.osm.pbf
+      - name: Build experimental size-tuned tiles at zoom 14
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/work" -w /work --memory=7g \
+            openmaptiles/planetiler-openmaptiles:latest \
+            --force --download --osm_path=/work/region.osm.pbf \
+            --output=/work/output/lean.pmtiles --maxzoom=14 \
+            --min_feature_size=1.5 --simplify_tolerance=0.15
+      - name: Compare PMTiles sizes and validate essential layers
+        run: |
+          python3 - <<'PY'
+          import gzip,json,pathlib,struct,os
+          def inspect(name):
+            p=pathlib.Path("output")/name
+            with p.open("rb") as f:
+              h=f.read(127)
+              if h[:7]!=b"PMTiles" or h[7]!=3 or h[99]!=1:
+                raise ValueError(f"{name} is not a PMTiles v3 vector archive")
+              off,size=struct.unpack_from("<QQ",h,24)
+              if off<127 or size>2_000_000 or off+size>p.stat().st_size:
+                raise ValueError(f"{name} has invalid metadata")
+              f.seek(off)
+              blob=f.read(size)
+              if h[97]==2:blob=gzip.decompress(blob)
+              layers={a["id"] for a in json.loads(blob)["vector_layers"]}
+              if not {"transportation","water","building","place","poi"}.issubset(layers):
+                raise ValueError(f"{name} missing essential Zenith layers")
+              if h[101]!=14:raise ValueError(f"{name} not maxzoom=14")
+              return p.stat().st_size
+          baseline=inspect("baseline.pmtiles")
+          experimental=inspect("lean.pmtiles")
+          change=(baseline-experimental)*100/baseline
+          report=(f"## Zoom-14 tile storage benchmark\n\n"
+             f"Baseline: {baseline/1048576:.2f} MiB\n\n"
+             f"Experimental: {experimental/1048576:.2f} MiB\n\n"
+             f"Size reduction: {change:+.2f}% (negative means increase)\n\n"
+             f"Road, building, water, place, POI layers and zoom 14 preserved.\n\n"
+             f"Device-rendering inspection still required before production adoption.\n")
+          print(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:f.write(report)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: experimental-lean-z14-pmtiles
+          path: output/lean.pmtiles
+          retention-days: 3
+          if-no-files-found: error
